@@ -1,0 +1,20 @@
+﻿# 编译中间产物
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+build/*.obj
+.vs/
+x64/
+Debug/
+Release/
+
+# 自测输出
+st_*.bmp
+st_*.png
+
+# 编辑器
+*.user
+*.suo
