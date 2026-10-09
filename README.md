@@ -8,6 +8,11 @@
 | [`贪吃蛇2/`](贪吃蛇2/) | 2.0 | 修掉 bug 的版本。控制台 + 局部刷新，稳定流畅 |
 | [`贪吃蛇3/`](贪吃蛇3/) | 3.0 | **全新重写**。真正的图形窗口、平滑移动、漂亮的蛇和苹果、完整 UI、最高分记录 |
 
+> **2026-10 更新（3.1）**：修好了"一顿一顿"的卡顿（计时器精度 + 主循环重写，
+> 实测整帧 3.7ms、帧间隔抖动 0.35ms）；棋盘从 26×19 扩到 **34×24**；
+> 蛇重做了 —— 8 段渐变色带、顺身体方向的菱形鳞片、整条蛇会"游"起来的波浪动画、
+> 更精致的蛇头。详情见 [贪吃蛇3/README.md](贪吃蛇3/README.md)。
+
 ---
 
 ## 贪吃蛇 3.0 —— 直接玩
@@ -135,7 +140,7 @@ BuildTools / VS2019，也会用 `vswhere` 兜底），你不用改任何路径�
 cl /nologo /utf-8 /W3 /O2 /MT /DNDEBUG ^
    /Fe:build\Snake3.exe /Fo:build\ ^
    src\engine.c src\art.c src\game.c ^
-   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib
+   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib winmm.lib
 ```
 
 - `/utf-8`：源文件带中文注释，必须加
@@ -148,7 +153,7 @@ cl /nologo /utf-8 /W3 /O2 /MT /DNDEBUG ^
 
 ```bash
 gcc -O2 -municode -o Snake3.exe src/engine.c src/art.c src/game.c \
-    -luser32 -lgdi32 -lshell32 -mwindows
+    -luser32 -lgdi32 -lshell32 -lwinmm -mwindows
 ```
 
 ---

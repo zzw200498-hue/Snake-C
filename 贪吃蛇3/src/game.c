@@ -31,8 +31,8 @@
 /* ===========================================================================
  *  可调参数
  * ===========================================================================*/
-#define GRID_COLS      26          /* 横向格子数 */
-#define GRID_ROWS      19          /* 纵向格子数 */
+#define GRID_COLS      34          /* 横向格子数 */
+#define GRID_ROWS      24          /* 纵向格子数 */
 #define CELL           30.0f       /* 每格逻辑像素 */
 
 #define HUD_H          76.0f       /* 顶部信息栏高度 */
@@ -41,7 +41,7 @@
 #define BOARD_W        (GRID_COLS * CELL)
 #define BOARD_H        (GRID_ROWS * CELL)
 
-#define WIN_W          ((int)BOARD_W)     /* 780 */
+#define WIN_W          ((int)BOARD_W)     /* 1020 */
 #define WIN_H          ((int)(BOARD_H + HUD_H))
 
 #define MAX_SNAKE      (GRID_COLS * GRID_ROWS)
@@ -493,124 +493,287 @@ static float seg_radius(int i)
     /* 前 60% 几乎保持粗细，最后 40% 快速收窄 —— 更像真蛇 */
     float taper = t < 0.6f ? t * 0.25f : 0.15f + (t - 0.6f) * 1.9f;
     if (taper > 1.0f) taper = 1.0f;
-    return CELL * (0.42f - 0.26f * taper);
+    return CELL * (0.44f - 0.28f * taper);
+}
+
+/* ---------------------------------------------------------------------------
+ *  蛇身颜色渐变
+ *
+ *  旧版整条蛇是同一种绿色，看着像一根管子。现在从头到尾做 8 段色带：
+ *  头部是鲜亮的黄绿，往尾巴渐渐变成深沉的墨绿。
+ *  每段色带内部仍然用批处理一次画完，所以再长也不影响帧率。
+ * -------------------------------------------------------------------------*/
+#define SNAKE_BANDS 8
+
+static Color body_band_color(int band)
+{
+    /* 头部颜色：鲜亮的黄绿；尾部颜色：深墨绿 */
+    Color head_color = rgb(102, 222, 146);
+    Color tail_color = rgb(34, 118, 88);
+    float t = (float)band / (float)(SNAKE_BANDS - 1);
+    return mix(head_color, tail_color, t);
+}
+
+/* 第 i 节属于哪个色带（i=0 是头旁边那节，i 越大越靠尾巴） */
+static int body_band_index(int i)
+{
+    int band;
+    if (G.len <= 1) return 0;
+    band = i * SNAKE_BANDS / G.len;
+    if (band > SNAKE_BANDS - 1) band = SNAKE_BANDS - 1;
+    return band;
+}
+
+/* ---------------------------------------------------------------------------
+ *  游动波浪
+ *
+ *  旧版蛇拐弯是"硬折"，直着走时整条身体笔直，像一根被拖着的管子。
+ *  现在给每一节加上一个垂直于身体方向的小幅正弦摆动，并且相位沿着
+ *  身体从头传到尾 —— 蛇就是"游"起来的，波浪会沿着身体向后传。
+ *
+ *  两个刻意的限制：
+ *    · 头部波幅只有 40%：头的走位必须清晰，不然玩家会觉得判定不准
+ *    · 波幅很小（不到一格的 1/10）：纯装饰，不影响任何判定
+ * -------------------------------------------------------------------------*/
+static void draw_positions(float *out_x, float *out_y)
+{
+    int i;
+    for (i = 0; i < G.len; i++) {
+        float dir_x, dir_y;
+        float perp_x, perp_y;
+        float seg_dx, seg_dy;
+        float seg_len;
+        float amplitude;
+        float position_t;
+        float offset;
+        float phase;
+
+        /* 这一节的方向：用前后两节做"中央差分"，拐弯处方向自然就是斜的 */
+        if (G.len < 2) {
+            dir_x = (float)G.dirx;
+            dir_y = (float)G.diry;
+        } else if (i == 0) {
+            seg_dx = G.vis_x[0] - G.vis_x[1];
+            seg_dy = G.vis_y[0] - G.vis_y[1];
+            seg_len = (float)sqrt((double)(seg_dx * seg_dx + seg_dy * seg_dy));
+            if (seg_len > 0.001f) { dir_x = seg_dx / seg_len; dir_y = seg_dy / seg_len; }
+            else { dir_x = (float)G.dirx; dir_y = (float)G.diry; }
+        } else if (i == G.len - 1) {
+            seg_dx = G.vis_x[i] - G.vis_x[i - 1];
+            seg_dy = G.vis_y[i] - G.vis_y[i - 1];
+            seg_len = (float)sqrt((double)(seg_dx * seg_dx + seg_dy * seg_dy));
+            if (seg_len > 0.001f) { dir_x = seg_dx / seg_len; dir_y = seg_dy / seg_len; }
+            else { dir_x = (float)G.dirx; dir_y = (float)G.diry; }
+        } else {
+            seg_dx = G.vis_x[i - 1] - G.vis_x[i + 1];
+            seg_dy = G.vis_y[i - 1] - G.vis_y[i + 1];
+            seg_len = (float)sqrt((double)(seg_dx * seg_dx + seg_dy * seg_dy));
+            if (seg_len > 0.001f) { dir_x = seg_dx / seg_len; dir_y = seg_dy / seg_len; }
+            else { dir_x = (float)G.dirx; dir_y = (float)G.diry; }
+        }
+
+        /* 垂直于身体方向的单位向量 */
+        perp_x = -dir_y;
+        perp_y =  dir_x;
+
+        /* 波幅：头部收小（走位要清晰），往尾巴逐渐放大（更像真蛇摆尾） */
+        position_t = (G.len > 1) ? (float)i / (float)(G.len - 1) : 0.0f;
+        amplitude = CELL * (0.04f + 0.06f * position_t);
+        if (i == 0) amplitude *= 0.4f;
+
+        /* 相位沿身体向后传：i 越大相位越落后，波浪就是"流"过去的 */
+        phase = (float)G.t * 6.0f - (float)i * 0.85f;
+        offset = (float)sin(phase) * amplitude;
+
+        out_x[i] = G.vis_x[i] + perp_x * offset;
+        out_y[i] = G.vis_y[i] + perp_y * offset;
+    }
+}
+
+/* 每一节"实际要画"的位置（= 逻辑位置 + 波浪偏移），draw_positions 填写 */
+static float dr_x[MAX_SNAKE];
+static float dr_y[MAX_SNAKE];
+
+/* 把整条蛇的身体以"每点一个圆 + 每段一条带"的形式加进当前批处理。
+   效果和把相邻两点用胶囊连起来一样，但多边形数量少 1/3 ——
+   蛇越长这个差距越大，这是长蛇也不掉帧的关键之一。
+   off_x/off_y：整体偏移（画投影用）
+   scale_r   ：半径缩放（投影比本体稍微细一点）
+   extra_r   ：半径再加粗多少（画描边用） */
+static void chain_bodies(float off_x, float off_y, float scale_r, float extra_r)
+{
+    int i;
+    for (i = 0; i < G.len; i++) {
+        float r = seg_radius(i) * scale_r + extra_r;
+        eng_shape_circle(dr_x[i] + off_x, dr_y[i] + off_y, r);
+    }
+    for (i = 1; i < G.len; i++) {
+        float r  = seg_radius(i)     * scale_r + extra_r;
+        float r2 = seg_radius(i - 1) * scale_r + extra_r;
+        eng_shape_band(dr_x[i], dr_y[i], r, dr_x[i - 1], dr_y[i - 1], r2);
+    }
 }
 
 static void draw_snake(void)
 {
-    int i;
+    int i, band;
     float hdx, hdy;
     Color c_dark  = darken(COL_SNAKE, 0.42f);
-    Color c_main  = COL_SNAKE;
-    Color c_light = lighten(COL_SNAKE, 0.30f);
-    Color c_belly = COL_SNAKE_B;
+    Color c_light = mix(lighten(COL_SNAKE, 0.30f), COL_SNAKE, 0.30f);
+    Color c_belly = mix(COL_SNAKE_B, COL_SNAKE, 0.55f);
     Color c_shadow = rgb(12, 15, 24);
 
+    draw_positions(dr_x, dr_y);
     head_dir(&hdx, &hdy);
 
     /* ---- 第 0 遍：整条蛇的投影 ---- */
-    for (i = G.len - 1; i >= 1; i--) {
-        float r = seg_radius(i);
-        eng_capsule(G.vis_x[i] + 2.5f, G.vis_y[i] + 4.5f,
-                    G.vis_x[i - 1] + 2.5f, G.vis_y[i - 1] + 4.5f,
-                    r * 0.92f, c_shadow);
-    }
+    eng_shapes_reset();
+    eng_shape_circle(dr_x[0] + 2.5f, dr_y[0] + 4.5f, CELL * 0.50f);   /* 头的投影 */
+    chain_bodies(2.5f, 4.5f, 0.92f, 0.0f);
+    eng_shapes_fill(c_shadow);
 
     /* ---- 第 1 遍：深色底，比本体大一圈，形成柔和的描边 ---- */
-    for (i = G.len - 1; i >= 1; i--) {
-        float r = seg_radius(i);
-        float r2 = seg_radius(i - 1);
-        eng_capsule(G.vis_x[i], G.vis_y[i], G.vis_x[i - 1], G.vis_y[i - 1],
-                    (r + r2) * 0.5f + 2.0f, c_dark);
-    }
-    if (G.len > 1) {
-        eng_circle(G.vis_x[G.len - 1], G.vis_y[G.len - 1], seg_radius(G.len - 1) + 2.0f, c_dark);
-        /* 尾巴尖：再往前伸一点，收成一个点 */
-        {
-            int last = G.len - 1;
-            float dx = G.vis_x[last] - G.vis_x[last - 1];
-            float dy = G.vis_y[last] - G.vis_y[last - 1];
-            float m = (float)sqrt((double)(dx * dx + dy * dy));
-            if (m > 0.001f) {
-                float tx = G.vis_x[last] + dx / m * CELL * 0.52f;
-                float ty = G.vis_y[last] + dy / m * CELL * 0.52f;
-                eng_taper(G.vis_x[last], G.vis_y[last], seg_radius(last) * 2.0f + 4.0f,
-                          tx, ty, 3.0f, c_dark);
-            }
-        }
-    }
-
-    /* ---- 第 2 遍：身体本体（连续胶囊，接缝完全融合） ---- */
-    for (i = G.len - 1; i >= 1; i--) {
-        float r = seg_radius(i);
-        float r2 = seg_radius(i - 1);
-        eng_capsule(G.vis_x[i], G.vis_y[i], G.vis_x[i - 1], G.vis_y[i - 1],
-                    (r + r2) * 0.5f, c_main);
-    }
+    eng_shapes_reset();
+    chain_bodies(0.0f, 0.0f, 1.0f, 2.0f);
     if (G.len > 1) {
         int last = G.len - 1;
-        float dx = G.vis_x[last] - G.vis_x[last - 1];
-        float dy = G.vis_y[last] - G.vis_y[last - 1];
+        float dx = dr_x[last] - dr_x[last - 1];
+        float dy = dr_y[last] - dr_y[last - 1];
         float m = (float)sqrt((double)(dx * dx + dy * dy));
-        eng_circle(G.vis_x[last], G.vis_y[last], seg_radius(last), c_main);
         if (m > 0.001f) {
-            float tx = G.vis_x[last] + dx / m * CELL * 0.50f;
-            float ty = G.vis_y[last] + dy / m * CELL * 0.50f;
-            eng_taper(G.vis_x[last], G.vis_y[last], seg_radius(last) * 2.0f,
-                      tx, ty, 1.5f, c_main);
+            float tx = dr_x[last] + dx / m * CELL * 0.52f;
+            float ty = dr_y[last] + dy / m * CELL * 0.52f;
+            eng_shape_taper(dr_x[last], dr_y[last], seg_radius(last) * 2.0f + 4.0f,
+                            tx, ty, 3.0f);
         }
+    }
+    eng_shapes_fill(c_dark);
+
+    /* ---- 第 2 遍：身体本体，从头到尾 8 段渐变色带 ---- */
+    for (band = 0; band < SNAKE_BANDS; band++) {
+        eng_shapes_reset();
+        for (i = 0; i < G.len; i++) {
+            if (body_band_index(i) == band) {
+                eng_shape_circle(dr_x[i], dr_y[i], seg_radius(i));
+            }
+        }
+        for (i = 1; i < G.len; i++) {
+            if (body_band_index(i) == band) {
+                eng_shape_band(dr_x[i], dr_y[i], seg_radius(i),
+                               dr_x[i - 1], dr_y[i - 1], seg_radius(i - 1));
+            }
+        }
+        /* 尾巴尖跟最后一段同色 */
+        if (G.len > 1 && band == SNAKE_BANDS - 1) {
+            int last = G.len - 1;
+            float dx = dr_x[last] - dr_x[last - 1];
+            float dy = dr_y[last] - dr_y[last - 1];
+            float m = (float)sqrt((double)(dx * dx + dy * dy));
+            if (m > 0.001f) {
+                float tx = dr_x[last] + dx / m * CELL * 0.50f;
+                float ty = dr_y[last] + dy / m * CELL * 0.50f;
+                eng_shape_taper(dr_x[last], dr_y[last], seg_radius(last) * 2.0f,
+                                tx, ty, 1.5f);
+            }
+        }
+        eng_shapes_fill(body_band_color(band));
     }
 
     /* ---- 第 3 遍：立体感。
-       把每一小段当成一个"圆柱"，用一条偏移的高光带 + 一条偏移的暗边，
-       沿着整条蛇连续画过去，视觉上就成了一根有体积的管子。 ---- */
-    for (i = G.len - 1; i >= 1; i--) {
-        float r  = seg_radius(i);
-        float r2 = seg_radius(i - 1);
-        float x1 = G.vis_x[i],     y1 = G.vis_y[i];
-        float x2 = G.vis_x[i - 1], y2 = G.vis_y[i - 1];
-        float dx = x2 - x1, dy = y2 - y1;
-        float len = (float)sqrt((double)(dx * dx + dy * dy));
-        float nx, ny;
+       把每一小段当成一根"圆柱"，沿整条蛇连续地画一条偏移的高光带和
+       一条偏移的腹部亮色，视觉上就成了一根有体积的管子。 ---- */
+    {
+        /* 3a：背部高光（只画前一半身体 —— 尾巴越来越细，高光会挤成一坨） */
+        int light_limit = G.len / 2 + 2;
+        if (light_limit > G.len - 1) light_limit = G.len - 1;
+        eng_shapes_reset();
+        for (i = light_limit; i >= 1; i--) {
+            float r  = seg_radius(i);
+            float r2 = seg_radius(i - 1);
+            float x1 = dr_x[i],     y1 = dr_y[i];
+            float x2 = dr_x[i - 1], y2 = dr_y[i - 1];
+            float dx = x2 - x1, dy = y2 - y1;
+            float len = (float)sqrt((double)(dx * dx + dy * dy));
+            float nx, ny;
+            if (len < 0.001f) continue;
+            nx = -dy / len;
+            ny =  dx / len;
+            eng_shape_capsule(x1 + nx * r * 0.34f - r * 0.10f, y1 + ny * r * 0.34f - r * 0.26f,
+                              x2 + nx * r2 * 0.34f - r2 * 0.10f, y2 + ny * r2 * 0.34f - r2 * 0.26f,
+                              (r + r2) * 0.22f);
+        }
+        eng_shapes_fill(c_light);
 
-        if (len < 0.001f) continue;
-        nx = -dy / len;
-        ny =  dx / len;
-
-        /* 背部高光：整体往左上方偏移一点，模拟光从左上打过来 */
-        eng_capsule(x1 + nx * r * 0.34f - r * 0.10f, y1 + ny * r * 0.34f - r * 0.26f,
-                    x2 + nx * r2 * 0.34f - r2 * 0.10f, y2 + ny * r2 * 0.34f - r2 * 0.26f,
-                    (r + r2) * 0.22f, mix(c_light, c_main, 0.30f));
-
-        /* 腹部亮色：往右下偏移 */
-        eng_capsule(x1 - nx * r * 0.40f + r * 0.06f, y1 - ny * r * 0.40f + r * 0.22f,
-                    x2 - nx * r2 * 0.40f + r2 * 0.06f, y2 - ny * r2 * 0.40f + r2 * 0.22f,
-                    (r + r2) * 0.18f, mix(c_belly, c_main, 0.55f));
+        /* 3b：腹部亮色（同样只画前半段） */
+        eng_shapes_reset();
+        for (i = light_limit; i >= 1; i--) {
+            float r  = seg_radius(i);
+            float r2 = seg_radius(i - 1);
+            float x1 = dr_x[i],     y1 = dr_y[i];
+            float x2 = dr_x[i - 1], y2 = dr_y[i - 1];
+            float dx = x2 - x1, dy = y2 - y1;
+            float len = (float)sqrt((double)(dx * dx + dy * dy));
+            float nx, ny;
+            if (len < 0.001f) continue;
+            nx = -dy / len;
+            ny =  dx / len;
+            eng_shape_capsule(x1 - nx * r * 0.40f + r * 0.06f, y1 - ny * r * 0.40f + r * 0.22f,
+                              x2 - nx * r2 * 0.40f + r2 * 0.06f, y2 - ny * r2 * 0.40f + r2 * 0.22f,
+                              (r + r2) * 0.18f);
+        }
+        eng_shapes_fill(c_belly);
     }
 
-    /* ---- 第 4 遍：鳞纹 ---- */
-    for (i = G.len - 1; i >= 2; i--) {
-        art_snake_scales(G.vis_x[i], G.vis_y[i], seg_radius(i), i, (float)G.t,
-                         COL_SNAKE, COL_SNAKE_B);
+    /* ---- 第 4 遍：鳞纹。
+       旧版是不管方向的竖直小三角，而且只有一种颜色。
+       现在改成顺身体方向的菱形，深浅两种颜色交替，
+       两批各提交一次，蛇身上就有了规律的鳞片花纹。 ---- */
+    {
+        int parity;
+        for (parity = 0; parity < 2; parity++) {
+            eng_shapes_reset();
+            for (i = G.len - 1; i >= 2; i--) {
+                float dir_x, dir_y;
+                float seg_dx, seg_dy;
+                float seg_len;
+                if ((i % 2) != parity) continue;
+                seg_dx = dr_x[i - 1] - dr_x[i];
+                seg_dy = dr_y[i - 1] - dr_y[i];
+                seg_len = (float)sqrt((double)(seg_dx * seg_dx + seg_dy * seg_dy));
+                if (seg_len > 0.001f) {
+                    dir_x = seg_dx / seg_len;
+                    dir_y = seg_dy / seg_len;
+                } else {
+                    dir_x = (float)G.dirx;
+                    dir_y = (float)G.diry;
+                }
+                art_snake_scale(dr_x[i], dr_y[i], seg_radius(i), dir_x, dir_y, (float)G.t);
+            }
+            if (parity == 0) {
+                eng_shapes_fill(art_snake_scale_color_a(COL_SNAKE, COL_SNAKE_B));
+            } else {
+                eng_shapes_fill(art_snake_scale_color_b(COL_SNAKE, COL_SNAKE_B));
+            }
+        }
     }
 
     /* ---- 第 5 遍：头 ---- */
     {
         float dx = (float)G.dirx, dy = (float)G.diry;
         if (G.len > 1) {
-            float vx = G.vis_x[0] - G.vis_x[1];
-            float vy = G.vis_y[0] - G.vis_y[1];
+            float vx = dr_x[0] - dr_x[1];
+            float vy = dr_y[0] - dr_y[1];
             float m = (float)sqrt((double)(vx * vx + vy * vy));
             if (m > 0.6f) { dx = vx / m; dy = vy / m; }
         }
-        art_snake_head(G.vis_x[0], G.vis_y[0], CELL * 0.50f, dx, dy, (float)G.t,
+        art_snake_head(dr_x[0], dr_y[0], CELL * 0.50f, dx, dy, (float)G.t,
                        COL_SNAKE, COL_SNAKE_B);
     }
 
     /* ---- 吃到苹果时的金色光环 ---- */
     if (G.eat_flash > 0.01f) {
         float f = G.eat_flash;
-        eng_circle_outline(G.vis_x[0], G.vis_y[0], CELL * (0.6f + (1.0f - f) * 1.4f),
+        eng_circle_outline(dr_x[0], dr_y[0], CELL * (0.6f + (1.0f - f) * 1.4f),
                            3.0f * f, mix(COL_ACCENT_2, COL_BOARD_A, 1.0f - f));
     }
 }
@@ -720,16 +883,28 @@ static void draw_menu(void)
 
     draw_background(0, 0);
 
-    /* 背景里慢慢游动的装饰蛇，让菜单不空 */
+    /* 背景里慢慢游动的装饰蛇，让菜单不空。
+       旧版是一颗颗独立的圆点，断开的时候看起来不像蛇；
+       现在用"胶囊"把相邻两个点连起来，就是一整条在盘旋的蛇了。 */
     {
         int i;
+        float px_[26], py_[26];
         for (i = 0; i < 26; i++) {
             float ph = (float)G.t * 0.35f + i * 0.42f;
-            float px_ = cx + (float)sin(ph * 0.7f) * (eng_w() * 0.42f);
-            float py_ = eng_h() * 0.5f + (float)cos(ph * 0.5f) * (eng_h() * 0.36f);
+            px_[i] = cx + (float)sin(ph * 0.7f) * (eng_w() * 0.42f);
+            py_[i] = eng_h() * 0.5f + (float)cos(ph * 0.5f) * (eng_h() * 0.36f);
+        }
+        /* 先铺身体（从尾巴往头画，头最后画、盖在接缝上面） */
+        for (i = 25; i >= 1; i--) {
             float r = CELL * (0.40f - 0.20f * (i / 26.0f));
             Color c = mix(COL_SNAKE, COL_MENU_BG, 0.72f + 0.2f * (i / 26.0f));
-            eng_ellipse(px_, py_, r, r * 0.95f, c);
+            eng_capsule(px_[i], py_[i], px_[i - 1], py_[i - 1], r, c);
+        }
+        /* 再点一颗大一点的圆当脑袋 */
+        {
+            Color head_c = mix(COL_SNAKE, COL_MENU_BG, 0.72f);
+            float r = CELL * 0.42f;
+            eng_circle(px_[0], py_[0], r, head_c);
         }
     }
 
@@ -824,7 +999,6 @@ static void draw_gameover(void)
     eng_round(cx - w * 0.5f, cy - h * 0.5f, w, h, 20.0f, rgb(24, 29, 46));
     eng_round_outline(cx - w * 0.5f, cy - h * 0.5f, w, h, 20.0f, 2.0f,
                       G.is_new_best ? COL_ACCENT_2 : rgb(56, 66, 96));
-
     {
         float top = cy - h * 0.5f;
         char buf[80];
@@ -861,17 +1035,48 @@ static void draw_gameover(void)
             }
         }
         eng_text_center("空格 / R  再来一局        Esc / Q  主菜单",
-                        cx, top + h - 64.0f, FONT_SMALL, rgb(96, 108, 138));
+                        cx, top + h - 18.0f, FONT_SMALL, rgb(96, 108, 138));
     }
 }
 
 /* ===========================================================================
  *  一帧渲染
+ *
+ *  性能计时：只有在 --bench 时打开，平时这几个 if 的开销可以忽略。
  * ===========================================================================*/
+/* ===========================================================================
+ *  静态画面缓存
+ *
+ *  渐变背景 + 棋盘每帧都完全一样，却要花掉八百多次 FillRect。
+ *  这里预渲染到一张离屏表面上，之后每帧只要一次 BitBlt。
+ * ==========================================================================*/
+static EngSurface *g_static_surf = NULL;
+
+static void ensure_static_surface(void)
+{
+    if (g_static_surf) return;
+    /* 表面是位图，尺寸要用像素而不是逻辑坐标 */
+    g_static_surf = eng_surface_create((int)(eng_w() * eng_scale()),
+                                       (int)(eng_h() * eng_scale()));
+    if (!g_static_surf) return;
+
+    eng_target_begin(g_static_surf);
+    draw_background(0, 0);
+    draw_board(0, 0);
+    eng_target_end();
+}
+
+enum { P_BG = 0, P_BOARD, P_FOOD, P_SNAKE, P_HUD, P_BLIT, P_COUNT };
+static double g_prof[P_COUNT];
+static int    g_prof_on = 0;
+
+static void prof_add(int slot, double ms) { if (g_prof_on) g_prof[slot] += ms; }
+
 static void render(void)
 {
     float sx = 0, sy = 0;
     int board_only;
+    double t0;
 
     /* 撞死时抖一下 */
     if (G.shake > 0.01f) {
@@ -884,20 +1089,214 @@ static void render(void)
 
     board_only = (G.state == ST_PLAY || G.state == ST_PAUSE || G.state == ST_OVER);
 
-    draw_background(sx, sy);
-    draw_board(sx, sy);
+    t0 = eng_now_ms();
+    /* 背景 + 棋盘是一次预渲染的位图，这里只贴一次 */
+    ensure_static_surface();
+    if (g_static_surf) {
+        if (sx != 0.0f || sy != 0.0f) {
+            /* 抖动时先把整屏垫一层底色，否则偏移出来的边缘会露旧画面 */
+            eng_rect(-20, -20, (float)eng_w() + 40, (float)eng_h() + 40, COL_BG_BOT);
+        }
+        eng_surface_draw(g_static_surf, sx, sy);
+    } else {
+        draw_background(sx, sy);
+        draw_board(sx, sy);
+    }
+    prof_add(P_BG, eng_now_ms() - t0);
+
     if (board_only) {
         /* 蛇和苹果必须夹在信息栏和底部提示之间，
            否则贴近上边缘的苹果，叶子和果柄会画到信息栏上去。 */
         eng_clip(BOARD_X, BOARD_Y, BOARD_W, BOARD_H);
-        draw_apple();
-        draw_snake();
+        t0 = eng_now_ms(); draw_apple(); prof_add(P_FOOD, eng_now_ms() - t0);
+        t0 = eng_now_ms(); draw_snake(); prof_add(P_SNAKE, eng_now_ms() - t0);
         eng_clip_reset();
     }
-    draw_hud();
+    t0 = eng_now_ms(); draw_hud(); prof_add(P_HUD, eng_now_ms() - t0);
 
     if (G.state == ST_PAUSE)    draw_pause();
     if (G.state == ST_OVER)     draw_gameover();
+}
+
+/* 把 eng_end() 里的 blit 单独计时 */
+static void render_and_present(void)
+{
+    double t0 = eng_now_ms();
+    render();
+    prof_add(P_BLIT, eng_now_ms() - t0);
+    eng_end();
+}
+
+/* ===========================================================================
+ *  性能测试：Snake3.exe --bench [输出前缀] [蛇长]
+ *
+ *  人为造一条很长的蛇（默认 80 节，比正常玩到的大得多），
+ *  然后连续渲染若干帧，统计：
+ *    · 每个绘制阶段的平均耗时
+ *    · 整帧耗时
+ *    · 帧间隔的抖动（决定"看起来卡不卡"）
+ * ==========================================================================*/
+/* bench 里要用到日志，而日志定义在后面，这里先声明一下 */
+static FILE *g_log;
+static void logf_(const char *fmt, ...);
+
+#define BENCH_WARMUP 20
+#define BENCH_FRAMES 240
+
+/* bench 专用诊断输出：单独开一个无缓冲文件，完全不碰控制台。
+   这样即使控制台那边出问题，也能看到进度。 */
+static FILE *g_dbg = NULL;
+
+static void dbg_(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[512];
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (g_dbg) { fwrite(buf, 1, strlen(buf), g_dbg); fflush(g_dbg); }
+}
+
+static int bench(const char *prefix, int want_len)
+{
+    double t_start, t_end, elapsed;
+    int i, frame;
+    double frame_ms[BENCH_FRAMES];
+    double sum_update = 0, sum_total = 0;
+
+    (void)t_end; (void)elapsed;
+
+    /* 诊断文件先开，后面每一步都能看到 */
+    {
+        char dp[MAX_PATH];
+        _snprintf_s(dp, sizeof(dp), _TRUNCATE, "%s.dbg", prefix ? prefix : "bench");
+        g_dbg = fopen(dp, "wb");
+        if (g_dbg) setvbuf(g_dbg, NULL, _IONBF, 0);
+    }
+    dbg_("step 1: 诊断文件已打开\n");
+
+    eng_show_console(1);
+    dbg_("step 2: 窗口已开始\n");
+
+    {
+        char lp[MAX_PATH];
+        _snprintf_s(lp, sizeof(lp), _TRUNCATE, "%s.log", prefix ? prefix : "bench");
+        g_log = fopen(lp, "w");
+    }
+    dbg_("step 3: 日志已打开\n");
+
+    if (want_len < 5) want_len = 5;
+    if (want_len > GRID_COLS * GRID_ROWS) want_len = GRID_COLS * GRID_ROWS;
+
+    load_save();
+    dbg_("step 4: 存档已读\n");
+    G.difficulty = 1;
+    start_game();
+    dbg_("step 5: 开局完成\n");
+
+    /* 把蛇摆成一条盘起来的蛇，长度拉到 want_len */
+    {
+        int x = 2, y = 1, dir = 1;
+        G.len = 0;
+        /* 蛇形扫描，铺满前若干行 */
+        for (y = 1; y < GRID_ROWS - 1 && G.len < want_len; y += 2) {
+            if (dir > 0) {
+                for (x = 1; x < GRID_COLS - 1 && G.len < want_len; x++) {
+                    G.snake[G.len].x = x; G.snake[G.len].y = y; G.len++;
+                }
+            } else {
+                for (x = GRID_COLS - 2; x >= 1 && G.len < want_len; x--) {
+                    G.snake[G.len].x = x; G.snake[G.len].y = y; G.len++;
+                }
+            }
+            dir = -dir;
+        }
+    }
+    for (i = 0; i < G.len; i++) {
+        G.vis_x[i] = cell_cx(G.snake[i].x);
+        G.vis_y[i] = cell_cy(G.snake[i].y);
+    }
+    G.apple.x = GRID_COLS - 2;
+    G.apple.y = GRID_ROWS - 2;
+    G.state = ST_PLAY;
+    G.dirx = 1; G.diry = 0;
+
+    dbg_("[bench] 窗口 %dx%d，蛇长 %d，渲染 %d 帧\n",
+          eng_w(), eng_h(), G.len, BENCH_FRAMES);
+
+    /* ---- 预热 ---- */
+    dbg_("[bench] 预热开始\n");
+    for (frame = 0; frame < BENCH_WARMUP; frame++) {
+        if (!eng_begin()) { dbg_("[bench] 窗口提前关闭\n"); return 1; }
+        update(1.0 / 60.0);
+        render_and_present();
+        dbg_("[bench]   预热 %d/%d\n", frame + 1, BENCH_WARMUP);
+    }
+    dbg_("[bench] 预热完成\n");
+
+    memset(g_prof, 0, sizeof(g_prof));
+    g_prof_on = 1;
+
+    for (frame = 0; frame < BENCH_FRAMES; frame++) {
+        double f0, f1;
+        if (!eng_begin()) { g_prof_on = 0; dbg_("[bench] 窗口提前关闭\n"); return 1; }
+
+        f0 = eng_now_ms();
+        t_start = eng_now_ms();
+        update(1.0 / 60.0);
+        sum_update += eng_now_ms() - t_start;
+
+        render_and_present();
+
+        f1 = eng_now_ms();
+        frame_ms[frame] = f1 - f0;
+        sum_total += frame_ms[frame];
+
+        if ((frame % 40) == 0) dbg_("[bench]   测量 %d/%d\n", frame, BENCH_FRAMES);
+    }
+    dbg_("[bench] 测量完成\n");
+    g_prof_on = 0;
+
+    /* ---- 统计 ---- */
+    {
+        double avg_total = sum_total / BENCH_FRAMES;
+        double avg_update = sum_update / BENCH_FRAMES;
+        double avg_draw = (sum_total - sum_update) / BENCH_FRAMES;
+        double worst = 0;
+        int worst_i = 0;
+
+        for (frame = 0; frame < BENCH_FRAMES; frame++) {
+            if (frame_ms[frame] > worst) { worst = frame_ms[frame]; worst_i = frame; }
+        }
+
+        /* 帧间隔抖动：和平均值的平均偏差 */
+        {
+            double dev = 0;
+            for (frame = 0; frame < BENCH_FRAMES; frame++) dev += fabs(frame_ms[frame] - avg_total);
+            dev /= BENCH_FRAMES;
+
+            dbg_("[bench] 平均整帧 %.3f ms  (约 %.0f FPS)\n", avg_total,
+                  avg_total > 0 ? 1000.0 / avg_total : 0.0);
+            dbg_("[bench]   其中 update  %.3f ms\n", avg_update);
+            dbg_("[bench]   其中 绘制    %.3f ms\n", avg_draw);
+            dbg_("[bench] 最慢一帧 %.3f ms (第 %d 帧)\n", worst, worst_i);
+            dbg_("[bench] 帧间隔平均抖动 %.3f ms\n", dev);
+        }
+
+        dbg_("[bench] 分阶段平均耗时（每帧）:\n");
+        dbg_("[bench]   背景      %.3f ms\n", g_prof[P_BG] / BENCH_FRAMES);
+        dbg_("[bench]   棋盘      %.3f ms\n", g_prof[P_BOARD] / BENCH_FRAMES);
+        dbg_("[bench]   苹果      %.3f ms\n", g_prof[P_FOOD] / BENCH_FRAMES);
+        dbg_("[bench]   蛇        %.3f ms\n", g_prof[P_SNAKE] / BENCH_FRAMES);
+        dbg_("[bench]   信息栏    %.3f ms\n", g_prof[P_HUD] / BENCH_FRAMES);
+        dbg_("[bench]   绘制合计  %.3f ms\n",
+              (g_prof[P_BG] + g_prof[P_BOARD] + g_prof[P_FOOD] +
+               g_prof[P_SNAKE] + g_prof[P_HUD]) / BENCH_FRAMES);
+        dbg_("[bench]   送屏/贴图 %.3f ms\n", g_prof[P_BLIT] / BENCH_FRAMES);
+    }
+
+    if (g_log) fclose(g_log);
+    return 0;
 }
 
 /* ===========================================================================
@@ -1076,9 +1475,12 @@ static int selftest(const char *prefix)
  * ==========================================================================*/
 static int snake_main(int argc, char **argv)
 {
-    double prev, acc = 0;
+    double prev;
     char title[128];
     int last_best = -1;
+
+    /* 目标帧间隔：60 帧/秒。逻辑和画面每帧各跑一次，节奏稳定。 */
+    const double FRAME_TIME = 1.0 / 60.0;
 
     srand((unsigned)time(NULL));
 
@@ -1099,6 +1501,12 @@ static int snake_main(int argc, char **argv)
         return selftest(argc >= 3 ? argv[2] : "selftest");
     }
 
+    /* 性能测试模式 */
+    if (argc >= 2 && strcmp(argv[1], "--bench") == 0) {
+        return bench(argc >= 3 ? argv[2] : "bench",
+                     argc >= 4 ? atoi(argv[3]) : 80);
+    }
+
     load_save();
     G.state = ST_MENU;
     G.menu_sel = 0;
@@ -1107,22 +1515,28 @@ static int snake_main(int argc, char **argv)
 
     eng_set_cursor_visible(1);
 
+    /* =========================================================================
+     *  主循环（这一版重写过，是"卡"的根治点）
+     *
+     *  旧版有两个毛病，叠在一起造成一顿一顿的：
+     *    1. 没调 eng_timer_begin() 提高计时器精度，Sleep(1) 实际睡 15.6ms，
+     *       于是逻辑每 31ms 才更新一次（32 次/秒），动画天然不流畅
+     *    2. 循环里有个"不够一帧就再渲染一遍"的分支，把同一帧画面
+     *       重复画了两次 —— 白烧 CPU，看起来还是一卡一卡
+     *
+     *  现在的结构很简单，每一帧只做三件事：
+     *    处理输入 -> 更新逻辑+渲染 -> 把这一帧剩下的时间睡掉
+     *  帧间隔由"睡了多久"精确控制，60FPS 稳稳的。
+     * =======================================================================*/
+    eng_timer_begin();
+
     prev = now_s();
     while (eng_begin()) {
-        double now = now_s();
-        double dt = now - prev;
-        prev = now;
+        double frame_start = now_s();
+        double dt = frame_start - prev;
+        prev = frame_start;
         if (dt > 0.1) dt = 0.1;          /* 拖窗口/切换回来时不要一次跳太多 */
         if (dt < 0.0) dt = 0.0;
-
-        /* 目标 60FPS：不够一帧就只重绘、不动逻辑，这样速度不受显示器刷新率影响 */
-        acc += dt;
-        if (acc < 1.0 / 61.0) {
-            if (eng_begin()) { render(); eng_end(); }
-            eng_sleep_ms(1);
-            continue;
-        }
-        acc = 0;
 
         handle_input();
         update(dt);
@@ -1135,10 +1549,22 @@ static int snake_main(int argc, char **argv)
             last_best = G.best;
             _snprintf_s(t2, sizeof(t2), _TRUNCATE,
                         "贪吃蛇 3.0  ——  最高分 %d", G.best);
-            SetWindowTextA(GetActiveWindow(), t2);
+            eng_set_title(t2);
         }
-        eng_sleep_ms(1);
+
+        /* 帧率控制：算出这一帧还剩多少时间，睡掉它。
+           少睡 1ms 是留余量 —— Sleep 醒来总有一点误差，留 1ms
+           比睡满更稳（宁可偶尔多跑一帧，也别欠账越欠越多）。 */
+        {
+            double used = now_s() - frame_start;
+            double remain_ms = (FRAME_TIME - used) * 1000.0;
+            if (remain_ms > 2.0) {
+                eng_sleep_ms((int)(remain_ms - 1.0));
+            }
+        }
     }
+
+    eng_timer_end();
 
     /* 退出前释放一下 GDI 资源（进程结束系统会回收，这里只是个好习惯） */
     return 0;

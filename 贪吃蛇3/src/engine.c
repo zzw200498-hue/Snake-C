@@ -6,6 +6,7 @@
 
 #include "engine.h"
 
+#include <mmsystem.h>     /* timeBeginPeriod：提高计时器精度，让帧间隔稳定 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,10 +28,19 @@ typedef struct {
     float  scale;                /* DPI 缩放 */
     int    logical_w, logical_h; /* 逻辑尺寸 */
 
-    /* 画笔/画刷缓存：每次改颜色就重建太慢，这里做简单复用 */
+    /* 画笔/画刷缓存。
+       原来只有一个槽位，而棋盘是用两种颜色交替画的，相当于每次调用都
+       新建再删掉一个 GDI 对象 —— 一帧要造/删上千个，这是原来卡的主因之一。
+       现在按颜色缓存起来重复使用。 */
     HPEN   pen;
+    COLORREF pen_col;
+    int    pen_w;
     HBRUSH brush;
-    COLORREF pen_col, brush_col;
+    COLORREF brush_col;
+
+    /* 当前所有绘制调用的目标 DC。
+       平时是后台缓冲；预渲染静态画面时会临时切到离屏表面。 */
+    HDC    target_dc;
 
     HFONT  fonts[4];
 
@@ -65,40 +75,294 @@ static WCHAR *utf8_to_wide(const char *s)
 
 /* ===========================================================================
  *  颜色 / GDI 对象缓存
+ *
+ *  为什么要缓存：GDI 的 CreatePen / CreateSolidBrush 每次都要进出内核，
+ *  一帧几百上千次的话开销非常可观。棋盘、渐变背景这类画面用到的颜色
+ *  数量是固定且有限的，缓存下来之后每帧只是几次 SelectObject。
  * ===========================================================================*/
 static COLORREF to_ref(Color c) { return RGB(c.r, c.g, c.b); }
 
-/* 建一支画笔。GDI 画笔的宽度查不出来，所以我们自己记住上次的宽度。 */
-static int g_pen_w = -1;
+/* 逻辑坐标 -> 像素 */
+static int px(float v) { return (int)(v * g_eng.scale + 0.5f); }
+
+#define PEN_CACHE_MAX   128
+#define BRUSH_CACHE_MAX 512
+
+static struct { COLORREF key; int w; HPEN obj; }    g_pens[PEN_CACHE_MAX];
+static int    g_pen_n = 0;
+static struct { COLORREF key; HBRUSH obj; }          g_brushes[BRUSH_CACHE_MAX];
+static int    g_brush_n = 0;
+
+/* 当前已经选进 target_dc 的对象，避免重复 SelectObject */
+static HGDIOBJ g_sel_pen = NULL;
+static HGDIOBJ g_sel_brush = NULL;
+static HDC     g_sel_pen_dc = NULL;
+static HDC     g_sel_brush_dc = NULL;
+
+static void select_pen(HPEN p)
+{
+    if (g_sel_pen == p && g_sel_pen_dc == g_eng.target_dc) return;
+    SelectObject(g_eng.target_dc, p);
+    g_sel_pen = p;
+    g_sel_pen_dc = g_eng.target_dc;
+}
+
+static void select_brush(HBRUSH b)
+{
+    if (g_sel_brush == b && g_sel_brush_dc == g_eng.target_dc) return;
+    SelectObject(g_eng.target_dc, b);
+    g_sel_brush = b;
+    g_sel_brush_dc = g_eng.target_dc;
+}
 
 static void set_pen(Color c, float thick)
 {
     int w = (int)(thick * g_eng.scale + 0.5f);
     COLORREF ref = to_ref(c);
+    int i;
     if (w < 1) w = 1;
-    if (g_eng.pen && g_eng.pen_col == ref && g_pen_w == w) return;  /* 没变，直接用 */
-    if (g_eng.pen) DeleteObject(g_eng.pen);
-    g_eng.pen = CreatePen(PS_SOLID, w, ref);
-    g_eng.pen_col = ref;
-    g_pen_w = w;
-    SelectObject(g_eng.mem_dc, g_eng.pen);
+
+    for (i = 0; i < g_pen_n; i++) {
+        if (g_pens[i].key == ref && g_pens[i].w == w) { select_pen(g_pens[i].obj); return; }
+    }
+    if (g_pen_n < PEN_CACHE_MAX) {
+        g_pens[g_pen_n].key = ref;
+        g_pens[g_pen_n].w = w;
+        g_pens[g_pen_n].obj = CreatePen(PS_SOLID, w, ref);
+        select_pen(g_pens[g_pen_n].obj);
+        g_pen_n++;
+    } else {
+        /* 缓存满了（正常玩不会到），退化成临时创建，保证还能画 */
+        select_pen(CreatePen(PS_SOLID, w, ref));
+    }
 }
 
 static void set_brush(Color c)
 {
     COLORREF ref = to_ref(c);
-    if (g_eng.brush && g_eng.brush_col == ref) {
-        SelectObject(g_eng.mem_dc, g_eng.brush);
-        return;
+    int i;
+
+    for (i = 0; i < g_brush_n; i++) {
+        if (g_brushes[i].key == ref) { select_brush(g_brushes[i].obj); return; }
     }
-    if (g_eng.brush) DeleteObject(g_eng.brush);
-    g_eng.brush = CreateSolidBrush(ref);
-    g_eng.brush_col = ref;
-    SelectObject(g_eng.mem_dc, g_eng.brush);
+    if (g_brush_n < BRUSH_CACHE_MAX) {
+        g_brushes[g_brush_n].key = ref;
+        g_brushes[g_brush_n].obj = CreateSolidBrush(ref);
+        select_brush(g_brushes[g_brush_n].obj);
+        g_brush_n++;
+    } else {
+        select_brush(CreateSolidBrush(ref));
+    }
 }
 
-/* 逻辑坐标 -> 像素 */
-static int px(float v) { return (int)(v * g_eng.scale + 0.5f); }
+/* ===========================================================================
+ *  离屏表面
+ *
+ *  静态画面（渐变背景 + 棋盘）每帧重画一次纯属浪费 —— 它们根本不变。
+ *  这里支持把画面预渲染到一张离屏位图上，之后每帧只要一次 BitBlt。
+ * ===========================================================================*/
+struct EngSurface {
+    HDC     dc;
+    HBITMAP bmp;
+    HBITMAP old_bmp;
+    int     w, h;
+};
+
+EngSurface *eng_surface_create(int w, int h)
+{
+    EngSurface *s = (EngSurface *)calloc(1, sizeof(EngSurface));
+    HDC screen;
+    if (!s) return NULL;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    screen = GetDC(g_eng.hwnd);
+    s->dc  = CreateCompatibleDC(screen);
+    s->bmp = CreateCompatibleBitmap(screen, w, h);
+    ReleaseDC(g_eng.hwnd, screen);
+
+    if (!s->dc || !s->bmp) {
+        if (s->dc) DeleteDC(s->dc);
+        if (s->bmp) DeleteObject(s->bmp);
+        free(s);
+        return NULL;
+    }
+    s->old_bmp = (HBITMAP)SelectObject(s->dc, s->bmp);
+    s->w = w;
+    s->h = h;
+
+    SetBkMode(s->dc, TRANSPARENT);
+    SetStretchBltMode(s->dc, HALFTONE);
+    return s;
+}
+
+void eng_surface_destroy(EngSurface *s)
+{
+    if (!s) return;
+    if (s->dc) {
+        SelectObject(s->dc, s->old_bmp);
+        DeleteDC(s->dc);
+    }
+    if (s->bmp) DeleteObject(s->bmp);
+    free(s);
+}
+
+/* 之后所有绘制都画到这张表面上 */
+void eng_target_begin(EngSurface *s)
+{
+    if (!s) return;
+    g_eng.target_dc = s->dc;
+    /* 换 DC 了，之前记录的"已选中对象"全部失效 */
+    g_sel_pen = NULL; g_sel_brush = NULL;
+    g_sel_pen_dc = NULL; g_sel_brush_dc = NULL;
+    SelectClipRgn(s->dc, NULL);
+}
+
+/* 切回主缓冲 */
+void eng_target_end(void)
+{
+    g_eng.target_dc = g_eng.mem_dc;
+    g_sel_pen = NULL; g_sel_brush = NULL;
+    g_sel_pen_dc = NULL; g_sel_brush_dc = NULL;
+    if (g_eng.mem_dc) SelectClipRgn(g_eng.mem_dc, NULL);
+}
+
+void eng_surface_draw(EngSurface *s, float x, float y)
+{
+    if (!s || !s->dc) return;
+    BitBlt(g_eng.target_dc, px(x), px(y), s->w, s->h, s->dc, 0, 0, SRCCOPY);
+}
+
+int eng_surface_w(EngSurface *s) { return s ? s->w : 0; }
+int eng_surface_h(EngSurface *s) { return s ? s->h : 0; }
+
+/* ===========================================================================
+ *  图形批处理
+ *
+ *  蛇身是一条条胶囊拼出来的，五道工序 × 几十节，如果每节都单独调
+ *  Polygon + 两个 Ellipse，一帧就是上千次 GDI 调用。
+ *  这里把同色的形状攒起来，最后一次 PolyPolygon 提交。
+ * ===========================================================================*/
+#define SHAPE_MAX_PTS   (64 * 1024)
+#define SHAPE_MAX_POLY  4096
+#define CIRCLE_SEGS     12      /* 圆形用 12 边形近似，这个尺寸下肉眼分不出来 */
+
+static POINT  g_shape_pts[SHAPE_MAX_PTS];
+static int    g_shape_counts[SHAPE_MAX_POLY];
+static int    g_shape_pt_n = 0;
+static int    g_shape_poly_n = 0;
+static int    g_shape_overflow = 0;
+
+void eng_shapes_reset(void)
+{
+    g_shape_pt_n = 0;
+    g_shape_poly_n = 0;
+    g_shape_overflow = 0;
+}
+
+static void shape_add_poly(const POINT *pts, int n)
+{
+    int i;
+    if (g_shape_poly_n >= SHAPE_MAX_POLY || g_shape_pt_n + n > SHAPE_MAX_PTS) {
+        g_shape_overflow = 1;
+        return;
+    }
+    for (i = 0; i < n; i++) g_shape_pts[g_shape_pt_n + i] = pts[i];
+    g_shape_counts[g_shape_poly_n] = n;
+    g_shape_poly_n++;
+    g_shape_pt_n += n;
+}
+
+void eng_shape_circle(float cx, float cy, float radius)
+{
+    POINT p[CIRCLE_SEGS];
+    int i;
+    for (i = 0; i < CIRCLE_SEGS; i++) {
+        float a = (float)(2.0 * 3.14159265358979 * i / CIRCLE_SEGS);
+        p[i].x = px(cx + radius * (float)cos(a));
+        p[i].y = px(cy + radius * (float)sin(a));
+    }
+    shape_add_poly(p, CIRCLE_SEGS);
+}
+
+void eng_shape_capsule(float x1, float y1, float x2, float y2, float radius)
+{
+    float dx = x2 - x1, dy = y2 - y1;
+    float len = (float)sqrt((double)(dx * dx + dy * dy));
+    POINT p[4];
+
+    if (radius < 0.5f) radius = 0.5f;
+
+    if (len < 0.0001f) { eng_shape_circle(x1, y1, radius); return; }
+
+    dx /= len; dy /= len;
+    /* 矩形部分 */
+    p[0].x = px(x1 - dy * radius); p[0].y = px(y1 + dx * radius);
+    p[1].x = px(x2 - dy * radius); p[1].y = px(y2 + dx * radius);
+    p[2].x = px(x2 + dy * radius); p[2].y = px(y2 - dx * radius);
+    p[3].x = px(x1 + dy * radius); p[3].y = px(y1 - dx * radius);
+    shape_add_poly(p, 4);
+    /* 两端的半圆（用整圆代替，被矩形盖住一半，效果一样） */
+    eng_shape_circle(x1, y1, radius);
+    eng_shape_circle(x2, y2, radius);
+}
+
+void eng_shape_taper(float x1, float y1, float w1, float x2, float y2, float w2)
+{
+    float dx = x2 - x1, dy = y2 - y1;
+    float len = (float)sqrt((double)(dx * dx + dy * dy));
+    POINT p[4];
+    float r1, r2;
+
+    if (len < 0.0001f) { eng_shape_circle(x1, y1, w1 * 0.5f); return; }
+
+    dx /= len; dy /= len;
+    r1 = w1 * 0.5f; r2 = w2 * 0.5f;
+
+    p[0].x = px(x1 - dy * r1); p[0].y = px(y1 + dx * r1);
+    p[1].x = px(x2 - dy * r2); p[1].y = px(y2 + dx * r2);
+    p[2].x = px(x2 + dy * r2); p[2].y = px(y2 - dx * r2);
+    p[3].x = px(x1 + dy * r1); p[3].y = px(y1 - dx * r1);
+    shape_add_poly(p, 4);
+    eng_shape_circle(x1, y1, r1);
+    eng_shape_circle(x2, y2, r2);
+}
+
+/* 两点间的"条带"：只有中间的四边形，不带两端圆帽（见 engine.h 说明） */
+void eng_shape_band(float x1, float y1, float r1, float x2, float y2, float r2)
+{
+    float dx = x2 - x1, dy = y2 - y1;
+    float len = (float)sqrt((double)(dx * dx + dy * dy));
+    POINT p[4];
+
+    if (len < 0.0001f) return;
+
+    dx /= len; dy /= len;
+    p[0].x = px(x1 - dy * r1); p[0].y = px(y1 + dx * r1);
+    p[1].x = px(x2 - dy * r2); p[1].y = px(y2 + dx * r2);
+    p[2].x = px(x2 + dy * r2); p[2].y = px(y2 - dx * r2);
+    p[3].x = px(x1 + dy * r1); p[3].y = px(y1 - dx * r1);
+    shape_add_poly(p, 4);
+}
+
+void eng_shape_triangle(float x1, float y1, float x2, float y2, float x3, float y3)
+{
+    POINT p[3];
+    p[0].x = px(x1); p[0].y = px(y1);
+    p[1].x = px(x2); p[1].y = px(y2);
+    p[2].x = px(x3); p[2].y = px(y3);
+    shape_add_poly(p, 3);
+}
+
+void eng_shapes_fill(Color c)
+{
+    if (g_shape_poly_n == 0) return;
+    set_pen(c, 1.0f);
+    set_brush(c);
+    SetPolyFillMode(g_eng.target_dc, WINDING);
+    PolyPolygon(g_eng.target_dc, g_shape_pts, g_shape_counts, g_shape_poly_n);
+    eng_shapes_reset();
+}
 
 /* ===========================================================================
  *  窗口过程
@@ -179,9 +443,9 @@ static void create_backbuffer(HWND hwnd, int w, int h)
     }
     if (g_eng.mem_bmp) { DeleteObject(g_eng.mem_bmp); g_eng.mem_bmp = NULL; }
 
-    /* 重建缓冲区后，之前的画笔/画刷/字体都绑在旧 DC 上，全部作废 */
-    if (g_eng.pen)   { DeleteObject(g_eng.pen);   g_eng.pen = NULL;   g_pen_w = -1; }
-    if (g_eng.brush) { DeleteObject(g_eng.brush); g_eng.brush = NULL; }
+    /* 重建缓冲区后，之前记录的选择状态失效 */
+    g_sel_pen = NULL; g_sel_brush = NULL;
+    g_sel_pen_dc = NULL; g_sel_brush_dc = NULL;
 
     g_eng.mem_dc = CreateCompatibleDC(screen);
     g_eng.mem_bmp = CreateCompatibleBitmap(screen, w, h);
@@ -191,6 +455,11 @@ static void create_backbuffer(HWND hwnd, int w, int h)
 
     g_eng.buf_w = w;
     g_eng.buf_h = h;
+    g_eng.target_dc = g_eng.mem_dc;
+
+    /* 换过 DC，之前记录的"已选中对象"全部失效 */
+    g_sel_pen = NULL; g_sel_brush = NULL;
+    g_sel_pen_dc = NULL; g_sel_brush_dc = NULL;
 
     /* 画图质量：透明背景 + 平滑缩放 */
     SetBkMode(g_eng.mem_dc, TRANSPARENT);
@@ -340,7 +609,7 @@ void eng_clear(Color c)
     RECT r;
     r.left = 0; r.top = 0; r.right = g_eng.client_w; r.bottom = g_eng.client_h;
     set_brush(c);
-    FillRect(g_eng.mem_dc, &r, g_eng.brush);
+    FillRect(g_eng.target_dc, &r, g_eng.brush);
 }
 
 void eng_rect(float x, float y, float w, float h, Color c)
@@ -351,7 +620,7 @@ void eng_rect(float x, float y, float w, float h, Color c)
     set_brush(c);
     /* 用 ExtSelectClipRgn 之外最简单可靠的方式：FillRect 不走抗锯齿，
        但纯矩形本来就该是硬边，这里没问题 */
-    FillRect(g_eng.mem_dc, &r, g_eng.brush);
+    FillRect(g_eng.target_dc, &r, g_eng.brush);
 }
 
 /* 圆角矩形：GDI 自带 RoundRect，按像素放大后调用 */
@@ -361,17 +630,17 @@ void eng_round(float x, float y, float w, float h, float r, Color c)
     int d = px(r * 2);
     set_pen(c, 1.0f);
     set_brush(c);
-    RoundRect(g_eng.mem_dc, l, t, rr, bb, d, d);
+    RoundRect(g_eng.target_dc, l, t, rr, bb, d, d);
 }
 
 void eng_round_outline(float x, float y, float w, float h, float r, float thick, Color c)
 {
     int l = px(x), t = px(y), rr = px(x + w), bb = px(y + h);
     int d = px(r * 2);
-    HGDIOBJ old = SelectObject(g_eng.mem_dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ old = SelectObject(g_eng.target_dc, GetStockObject(NULL_BRUSH));
     set_pen(c, thick);
-    RoundRect(g_eng.mem_dc, l, t, rr, bb, d, d);
-    SelectObject(g_eng.mem_dc, old);
+    RoundRect(g_eng.target_dc, l, t, rr, bb, d, d);
+    SelectObject(g_eng.target_dc, old);
 }
 
 void eng_circle(float cx, float cy, float radius, Color c)
@@ -385,7 +654,7 @@ void eng_ellipse(float cx, float cy, float rx, float ry, Color c)
     int r = px(cx + rx), b = px(cy + ry);
     set_pen(c, 1.0f);
     set_brush(c);
-    Ellipse(g_eng.mem_dc, l, t, r, b);
+    Ellipse(g_eng.target_dc, l, t, r, b);
 }
 
 void eng_circle_outline(float cx, float cy, float radius, float thick, Color c)
@@ -397,17 +666,17 @@ void eng_ellipse_outline(float cx, float cy, float rx, float ry, float thick, Co
 {
     int l = px(cx - rx), t = px(cy - ry);
     int r = px(cx + rx), b = px(cy + ry);
-    HGDIOBJ old = SelectObject(g_eng.mem_dc, GetStockObject(NULL_BRUSH));
+    HGDIOBJ old = SelectObject(g_eng.target_dc, GetStockObject(NULL_BRUSH));
     set_pen(c, thick);
-    Ellipse(g_eng.mem_dc, l, t, r, b);
-    SelectObject(g_eng.mem_dc, old);
+    Ellipse(g_eng.target_dc, l, t, r, b);
+    SelectObject(g_eng.target_dc, old);
 }
 
 void eng_line(float x1, float y1, float x2, float y2, float thick, Color c)
 {
     set_pen(c, thick);
-    MoveToEx(g_eng.mem_dc, px(x1), px(y1), NULL);
-    LineTo(g_eng.mem_dc, px(x2), px(y2));
+    MoveToEx(g_eng.target_dc, px(x1), px(y1), NULL);
+    LineTo(g_eng.target_dc, px(x2), px(y2));
 }
 
 void eng_triangle(float x1, float y1, float x2, float y2, float x3, float y3, Color c)
@@ -418,7 +687,7 @@ void eng_triangle(float x1, float y1, float x2, float y2, float x3, float y3, Co
     p[2].x = px(x3); p[2].y = px(y3);
     set_pen(c, 1.0f);
     set_brush(c);
-    Polygon(g_eng.mem_dc, p, 3);
+    Polygon(g_eng.target_dc, p, 3);
 }
 
 void eng_pie(float cx, float cy, float rx, float ry, float a0, float a1, Color c)
@@ -433,7 +702,7 @@ void eng_pie(float cx, float cy, float rx, float ry, float a0, float a1, Color c
     int y1 = px(cy + ry * (float)sin(a1));
     set_pen(c, 1.0f);
     set_brush(c);
-    Pie(g_eng.mem_dc, l, t, r, b, x0, y0, x1, y1);
+    Pie(g_eng.target_dc, l, t, r, b, x0, y0, x1, y1);
 }
 
 /* 锥形线段：用上下两条边 + 两个半圆端帽近似，效果足够好 */
@@ -455,7 +724,7 @@ void eng_taper(float x1, float y1, float w1, float x2, float y2, float w2, Color
 
     set_pen(c, 1.0f);
     set_brush(c);
-    Polygon(g_eng.mem_dc, p, 4);
+    Polygon(g_eng.target_dc, p, 4);
     /* 两端补圆，衔接更顺 */
     eng_circle(x1, y1, w1 * 0.5f, c);
     eng_circle(x2, y2, w2 * 0.5f, c);
@@ -484,7 +753,7 @@ void eng_capsule(float x1, float y1, float x2, float y2, float radius, Color c)
 
     set_pen(c, 1.0f);
     set_brush(c);
-    Polygon(g_eng.mem_dc, p, 4);
+    Polygon(g_eng.target_dc, p, 4);
     eng_circle(x1, y1, radius, c);
     eng_circle(x2, y2, radius, c);
 }
@@ -495,13 +764,13 @@ void eng_capsule(float x1, float y1, float x2, float y2, float radius, Color c)
 void eng_clip(float x, float y, float w, float h)
 {
     HRGN rgn = CreateRectRgn(px(x), px(y), px(x + w), px(y + h));
-    SelectClipRgn(g_eng.mem_dc, rgn);
+    SelectClipRgn(g_eng.target_dc, rgn);
     DeleteObject(rgn);
 }
 
 void eng_clip_reset(void)
 {
-    SelectClipRgn(g_eng.mem_dc, NULL);
+    SelectClipRgn(g_eng.target_dc, NULL);
 }
 
 /* ===========================================================================
@@ -511,9 +780,9 @@ static void draw_text_raw(const char *utf8, float x, float y, FontId font, Color
 {
     WCHAR *w = utf8_to_wide(utf8);
     if (!w) return;
-    SelectObject(g_eng.mem_dc, g_eng.fonts[(int)font]);
-    SetTextColor(g_eng.mem_dc, to_ref(c));
-    TextOutW(g_eng.mem_dc, px(x), px(y), w, (int)wcslen(w));
+    SelectObject(g_eng.target_dc, g_eng.fonts[(int)font]);
+    SetTextColor(g_eng.target_dc, to_ref(c));
+    TextOutW(g_eng.target_dc, px(x), px(y), w, (int)wcslen(w));
     free(w);
 }
 
@@ -535,8 +804,8 @@ static int text_pixel_width(const char *utf8, FontId font)
     SIZE sz;
     int result = 0;
     if (!w) return 0;
-    SelectObject(g_eng.mem_dc, g_eng.fonts[(int)font]);
-    if (GetTextExtentPoint32W(g_eng.mem_dc, w, (int)wcslen(w), &sz)) {
+    SelectObject(g_eng.target_dc, g_eng.fonts[(int)font]);
+    if (GetTextExtentPoint32W(g_eng.target_dc, w, (int)wcslen(w), &sz)) {
         result = (int)(sz.cx / g_eng.scale + 0.5f);
     }
     free(w);
@@ -588,6 +857,13 @@ void eng_sleep_ms(int ms)
     if (ms > 0) Sleep((DWORD)ms);
 }
 
+/* 把系统计时器精度提到 1ms。
+   默认情况下 Sleep(1) 实际会睡到下一个时钟节拍（约 15.6ms），
+   于是主循环变成"一帧 21ms 一帧 8ms"这种不均匀的节奏 —— 画面就会看着一顿一顿的。
+   提精度之后 Sleep(1) 真的只睡 1ms，帧间隔才能稳定。 */
+void eng_timer_begin(void) { timeBeginPeriod(1); }
+void eng_timer_end(void)   { timeEndPeriod(1); }
+
 double eng_now_ms(void)
 {
     LARGE_INTEGER freq, now;
@@ -616,6 +892,16 @@ void eng_quit(void)
 {
     g_eng.running = 0;
     if (g_eng.hwnd) PostMessageW(g_eng.hwnd, WM_CLOSE, 0, 0);
+}
+
+/* 改窗口标题。之前游戏里用 GetActiveWindow() 拿句柄，
+   但焦点不在游戏窗口上时会改到别的窗口的标题，所以改成引擎自己存句柄。 */
+void eng_set_title(const char *utf8)
+{
+    WCHAR *w = utf8_to_wide(utf8);
+    if (!w) return;
+    if (g_eng.hwnd) SetWindowTextW(g_eng.hwnd, w);
+    free(w);
 }
 
 /* 把后台缓冲存成 24 位 BMP（自测用） */

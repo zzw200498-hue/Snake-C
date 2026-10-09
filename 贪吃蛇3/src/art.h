@@ -30,17 +30,25 @@ void art_apple_icon(float cx, float cy, float size, float phase);
  *  画法说明（这是这一版"蛇身建模"的关键）：
  *    1. 先用"胶囊"把相邻的两个身体点连起来，铺出一整条连续的轮廓
  *       —— 这样蛇身是一个整体，不会变成一颗一颗断开的珠子
- *    2. 在轮廓上叠一条连续的背部高光和一条腹部亮色，做出圆柱体的体积感
- *    3. 最后每隔一节点一片鳞纹，增加细节
- *    4. 蛇头单独绘制（更大、有眼睛、会吐信）
+ *    2. 身体从头到尾分成 8 段颜色渐变的色带（见 game.c 的 draw_snake）
+ *    3. 在轮廓上叠一条连续的背部高光和一条腹部亮色，做出圆柱体的体积感
+ *    4. 最后每隔一节点一片鳞纹，两种颜色交替，增加细节
+ *    5. 蛇头单独绘制（更大、有眼睛、会吐信）
  * -------------------------------------------------------------------------*/
 
 /* 蛇头 */
 void art_snake_head(float x, float y, float radius, float dirx, float diry, float t,
                     Color body_color, Color belly_color);
 
-/* 身体上的一片鳞纹 + 一点点明暗起伏（画在已铺好的轮廓之上） */
-void art_snake_scales(float x, float y, float radius, int index, float t,
-                      Color body_color, Color belly_color);
+/* 身体上的一片鳞纹：顺身体方向的菱形。
+   dirx/diry 是这一节身体的方向（单位向量）。
+   注意：它只是把三角形加进当前批处理，不会立刻绘制。
+   调用方把深浅两种颜色的鳞片分成两批，最后各自 eng_shapes_fill() 提交。 */
+void art_snake_scale(float x, float y, float radius,
+                     float dirx, float diry, float t);
+
+/* 鳞纹用的两种颜色（深 / 浅交替） */
+Color art_snake_scale_color_a(Color body_color, Color belly_color);
+Color art_snake_scale_color_b(Color body_color, Color belly_color);
 
 #endif /* ART_H */

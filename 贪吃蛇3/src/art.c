@@ -111,6 +111,7 @@ void art_snake_head(float x, float y, float radius, float dirx, float diry, floa
     Color eye_d  = rgb(16, 18, 30);
     Color eye_hi = rgb(215, 235, 255);
     Color tongue = rgb(232, 64, 92);
+    Color mouth  = darken(body_color, 0.60f);
 
     /* ---- 头影 ---- */
     eng_ellipse(x + 2.0f, y + radius * 0.42f, radius * 1.02f, radius * 0.52f,
@@ -133,13 +134,25 @@ void art_snake_head(float x, float y, float radius, float dirx, float diry, floa
                 ang - PI * 0.42f, ang + PI * 0.42f, mix(belly, body_color, 0.35f));
     }
 
-    /* ---- 舌头：前端快速伸缩，微微分叉 ---- */
+    /* ---- 嘴：鼻尖后面一条短短的横线（俯视角度下蛇嘴的样子） ---- */
     {
-        float flick = (float)sin(t * 7.0f);
-        float out   = 0.55f + 0.45f * flick;          /* 0~1 */
-        if (out > 0.35f) {
-            float base_len = radius * 1.10f;
-            float len  = base_len + radius * 0.55f * out;
+        float mx = x + ca * radius * 0.96f;
+        float my = y + sa * radius * 0.96f;
+        eng_line(mx + nx * radius * 0.20f, my + ny * radius * 0.20f,
+                 mx - nx * radius * 0.20f, my - ny * radius * 0.20f,
+                 radius * 0.09f, mouth);
+    }
+
+    /* ---- 舌头：有节奏地一伸一收。
+         flick 在 0~1 之间摆动，只有超过 0.3 才伸出来，
+         这样舌头是"吐一下、缩回去、再吐一下"，而不是一直抖。 ---- */
+    {
+        float flick = (float)sin(t * 5.5f);
+        float out   = 0.5f + 0.5f * flick;          /* 0~1 */
+        if (out > 0.3f) {
+            float strength = (out - 0.3f) / 0.7f;   /* 伸出的力度 0~1 */
+            float base_len = radius * 1.05f;
+            float len  = base_len + radius * 0.75f * strength;
             float bx = x + ca * radius * 1.05f, by = y + sa * radius * 1.05f;
             float tx = x + ca * len,            ty = y + sa * len;
             float w  = radius * 0.13f;
@@ -155,11 +168,11 @@ void art_snake_head(float x, float y, float radius, float dirx, float diry, floa
         }
     }
 
-    /* ---- 眼睛：略微往前 + 往两侧 ---- */
+    /* ---- 眼睛：略微往前 + 往两侧，比旧版大一圈 ---- */
     {
-        float ex_f = radius * 0.34f;    /* 往前 */
-        float ex_s = radius * 0.52f;    /* 往两侧 */
-        float ey_r = radius * 0.30f;    /* 眼白半径 */
+        float ex_f = radius * 0.32f;    /* 往前 */
+        float ex_s = radius * 0.54f;    /* 往两侧 */
+        float ey_r = radius * 0.34f;    /* 眼白半径（旧版 0.30） */
         int i;
         for (i = -1; i <= 1; i += 2) {
             float ex = x + ca * ex_f + nx * ex_s * i;
@@ -170,8 +183,9 @@ void art_snake_head(float x, float y, float radius, float dirx, float diry, floa
             /* 瞳孔：稍微偏向行进方向 */
             eng_ellipse(ex + ca * ey_r * 0.26f, ey + sa * ey_r * 0.26f,
                         ey_r * 0.52f, ey_r * 0.60f, eye_d);
-            /* 眼底反光 */
-            eng_circle(ex - ey_r * 0.26f, ey - ey_r * 0.34f, ey_r * 0.20f, eye_hi);
+            /* 两个反光点：一大一小，眼睛立刻就有神了 */
+            eng_circle(ex - ey_r * 0.28f, ey - ey_r * 0.36f, ey_r * 0.22f, eye_hi);
+            eng_circle(ex + ey_r * 0.18f, ey - ey_r * 0.10f, ey_r * 0.10f, eye_hi);
         }
     }
 
@@ -191,25 +205,53 @@ void art_snake_head(float x, float y, float radius, float dirx, float diry, floa
 /* ===========================================================================
  *  身体鳞纹
  *
- *  蛇身的"整体轮廓 + 立体感"由 game.c 里的胶囊连接负责，
- *  这里只负责在已有的身体上叠装饰性的鳞片和一点明暗，增加细节。
+ *  蛇身的"整体轮廓 + 立体感"由 game.c 里的胶囊连接负责。
+ *  这里只把一片鳞纹加进当前的批处理 —— 它不直接绘制，而是攒起来
+ *  由调用方一次性提交（PolyPolygon）。这样蛇再长也不会拖慢帧率。
+ *
+ *  旧版的鳞片是不管蛇往哪走的竖直小三角，横着走的时候看起来很别扭。
+ *  现在改成顺身体方向的菱形：一头尖顺着前进方向，像真的鳞片排列。
  * ==========================================================================*/
-void art_snake_scales(float x, float y, float radius, int index, float t,
-                      Color body_color, Color belly_color)
+void art_snake_scale(float x, float y, float radius,
+                     float dirx, float diry, float t)
 {
-    Color dark  = darken(body_color, 0.30f);
-    Color light = lighten(body_color, 0.22f);
+    /* 菱形的四个"半径"：沿身体方向长一点，横方向窄一点 */
+    float s_front = radius * 0.42f;   /* 朝头那一侧的尖 */
+    float s_back  = radius * 0.30f;   /* 朝尾巴那一侧的尖 */
+    float s_side  = radius * 0.34f;   /* 两侧的尖 */
+    float perp_x, perp_y;
+    float wobble;
 
-    /* 上半部一点受光，让身体有圆柱感 */
-    eng_pie(x, y, radius * 0.80f, radius * 0.72f, PI * 1.15f, PI * 1.85f,
-            mix(light, body_color, 0.45f));
+    /* 垂直于身体方向的单位向量 */
+    perp_x = -diry;
+    perp_y =  dirx;
 
-    /* 每隔一节点一片菱形鳞纹 */
-    if ((index % 2) == 0) {
-        Color scale = mix(dark, belly_color, 0.30f);
-        float s = radius * 0.30f;
-        float wob = (float)sin(t * 3.0f + index * 0.8f) * radius * 0.05f;
-        eng_triangle(x - s * 0.85f, y + wob, x + s * 0.85f, y + wob,
-                     x, y - s * 1.05f, scale);
+    /* 轻微的呼吸起伏，让鳞片不是死死贴着不动的 */
+    wobble = (float)sin(t * 3.0f + x * 0.15f + y * 0.15f) * radius * 0.04f;
+
+    /* 菱形拆成两个三角形提交（批处理只收三角形） */
+    {
+        float front_x = x + dirx * (s_front + wobble);
+        float front_y = y + diry * (s_front + wobble);
+        float back_x  = x - dirx * s_back;
+        float back_y  = y - diry * s_back;
+        float left_x  = x + perp_x * s_side;
+        float left_y  = y + perp_y * s_side;
+        float right_x = x - perp_x * s_side;
+        float right_y = y - perp_y * s_side;
+
+        eng_shape_triangle(front_x, front_y, left_x, left_y, back_x, back_y);
+        eng_shape_triangle(front_x, front_y, back_x, back_y, right_x, right_y);
     }
+}
+
+/* 鳞纹的两种颜色：深浅交替，铺出来就是规律的鳞片花纹 */
+Color art_snake_scale_color_a(Color body_color, Color belly_color)
+{
+    return mix(darken(body_color, 0.34f), belly_color, 0.20f);
+}
+
+Color art_snake_scale_color_b(Color body_color, Color belly_color)
+{
+    return mix(lighten(body_color, 0.16f), belly_color, 0.42f);
 }

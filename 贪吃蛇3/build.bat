@@ -70,7 +70,7 @@ set "SRC=src\engine.c src\art.c src\game.c"
 cl /nologo /utf-8 /W3 /O2 /MT /DNDEBUG ^
    /Fe:build\Snake3.exe /Fo:build\ ^
    %SRC% ^
-   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib
+   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib winmm.lib
 
 if errorlevel 1 (
   echo.

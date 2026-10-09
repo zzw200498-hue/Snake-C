@@ -84,6 +84,36 @@ void  eng_capsule(float x1, float y1, float x2, float y2, float radius, Color c)
 void  eng_clip(float x, float y, float w, float h);
 void  eng_clip_reset(void);
 
+/* --- 离屏表面：把不变的东西预渲染一次，之后每帧只要一次 BitBlt --- */
+typedef struct EngSurface EngSurface;
+
+EngSurface *eng_surface_create(int w, int h);
+void  eng_surface_destroy(EngSurface *s);
+/* 之后所有绘制都画到这张表面上，画完调 eng_target_end() 切回来 */
+void  eng_target_begin(EngSurface *s);
+void  eng_target_end(void);
+/* 把表面贴到当前目标上 */
+void  eng_surface_draw(EngSurface *s, float x, float y);
+int   eng_surface_w(EngSurface *s);
+int   eng_surface_h(EngSurface *s);
+
+/* --- 图形批处理：把很多同色的形状攒起来一次性提交，大幅减少 GDI 调用 ---
+   用法：
+       eng_shapes_reset();
+       eng_shape_capsule(...);   // 想加多少加多少
+       eng_shape_circle(...);
+       eng_shapes_fill(颜色);    // 一次性画出来（内部会 reset）           */
+void  eng_shapes_reset(void);
+void  eng_shape_circle(float cx, float cy, float radius);
+void  eng_shape_capsule(float x1, float y1, float x2, float y2, float radius);
+/* 两点间的"条带"：只有中间的四边形，不带两端圆帽。
+   画一连串首尾相连的身体时用"每个连接点一个圆 + 每段一条带"，
+   比每段都画胶囊少 1/3 的多边形，蛇变长时差距很明显。 */
+void  eng_shape_band(float x1, float y1, float r1, float x2, float y2, float r2);
+void  eng_shape_taper(float x1, float y1, float w1, float x2, float y2, float w2);
+void  eng_shape_triangle(float x1, float y1, float x2, float y2, float x3, float y3);
+void  eng_shapes_fill(Color c);
+
 /* --- 文字 --- */
 typedef enum {
     FONT_SMALL = 0,   /* 小字，说明用 */
@@ -112,9 +142,15 @@ int   eng_mouse_pressed(void);
 /* --- 其他 --- */
 void  eng_sleep_ms(int ms);
 double eng_now_ms(void);
+/* 把系统计时器精度提到 1ms。不调的话 Sleep(1) 实际会睡约 15.6ms，
+   主循环节奏会变得不均匀，画面看着就一顿一顿的。 */
+void  eng_timer_begin(void);
+void  eng_timer_end(void);
 void  eng_show_console(int show);     /* 发布版把控制台藏起来 */
 void  eng_set_cursor_visible(int visible);
 void  eng_quit(void);
+/* 改窗口标题（游戏里分数变化时用）。UTF-8 传中文。 */
+void  eng_set_title(const char *utf8);
 
 /* 开发用：把客户区截图存成 BMP，方便无显示器时自测 */
 int   eng_screenshot(const char *path);
